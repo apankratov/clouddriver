@@ -33,11 +33,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static com.amazonaws.auth.policy.actions.CloudFormationActions.DescribeStacks;
+
 @Slf4j
 public class DeployCloudFormationAtomicOperation implements AtomicOperation<Map> {
 
   private static final String BASE_PHASE = "DEPLOY_CLOUDFORMATION_STACK";
-
 
   @Autowired
   AmazonClientProvider amazonClientProvider;
@@ -55,7 +56,7 @@ public class DeployCloudFormationAtomicOperation implements AtomicOperation<Map>
   @Override
   public Map operate(List priorOutputs) {
     Task task = TaskRepository.threadLocalTask.get();
-    task.updateStatus(BASE_PHASE, "Configuring CloudFormation Stack");
+    task.updateStatus(BASE_PHASE, "Configuring CloudFormation Stack " + description.getStackName());
     AmazonCloudFormation amazonCloudFormation = amazonClientProvider.getAmazonCloudFormation(
       description.getCredentials(), description.getRegion());
     String template;
@@ -74,13 +75,57 @@ public class DeployCloudFormationAtomicOperation implements AtomicOperation<Map>
         .withKey(entry.getKey())
         .withValue(entry.getValue()))
       .collect(Collectors.toList());
+
+    String stackId = "";
+    StackStatus stackStatus = StackStatus.fromValue(getStack(amazonCloudFormation).getStackStatus());
     try {
-      String stackId = createStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
-      return Collections.singletonMap("stackId", stackId);
-    } catch (AlreadyExistsException e) {
-      String stackId = updateStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
-      return Collections.singletonMap("stackId", stackId);
+      switch (stackStatus) {
+        case CREATE_FAILED:
+        case ROLLBACK_COMPLETE:
+          task.updateStatus(BASE_PHASE, "Stack exists, but is not updatable, deleting and re-creating.");
+          deleteStack(amazonCloudFormation);
+          stackId = createStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
+          break;
+        case CREATE_COMPLETE:
+        case UPDATE_ROLLBACK_COMPLETE:
+        case UPDATE_COMPLETE:
+          stackId = updateStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
+          break;
+        case ROLLBACK_FAILED:
+        case DELETE_FAILED:
+        case UPDATE_ROLLBACK_FAILED:
+          task.updateStatus(BASE_PHASE, "Stack is stuck, manual actions are required in AWS console.");
+          task.fail();
+          break;
+      }
+    } catch (IllegalArgumentException e) {
+      stackId = createStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
     }
+    return Collections.singletonMap("stackId", stackId);
+  }
+
+
+  private void deleteStack(AmazonCloudFormation amazonCloudFormation) {
+    Task task = TaskRepository.threadLocalTask.get();
+    task.updateStatus(BASE_PHASE, "Deleting CloudFormation Stack");
+    DeleteStackRequest deleteStackRequest = new DeleteStackRequest()
+      .withStackName(description.getStackName());
+    DeleteStackResult deleteStackResult = amazonCloudFormation.deleteStack(deleteStackRequest);
+    task.updateStatus(BASE_PHASE, "Stack " + description.getStackName() + " deleted.");
+  }
+
+  private Stack getStack(AmazonCloudFormation amazonCloudFormation) {
+    Task task = TaskRepository.threadLocalTask.get();
+    task.updateStatus(BASE_PHASE, "Getting current CloudFormation Stack status");
+    DescribeStacksRequest describeStacksRequest = new DescribeStacksRequest()
+      .withStackName(description.getStackName());
+    DescribeStacksResult describeStacksResult = amazonCloudFormation.describeStacks(describeStacksRequest);
+    return describeStacksResult
+      .getStacks()
+      .stream()
+      .findFirst()
+      .orElseThrow( () ->
+        new IllegalArgumentException("No CloudFormation Stack found with stack name " + description.getStackName()));
   }
 
   private String createStack(AmazonCloudFormation amazonCloudFormation, String template, List<Parameter> parameters,
@@ -113,15 +158,7 @@ public class DeployCloudFormationAtomicOperation implements AtomicOperation<Map>
       UpdateStackResult updateStackResult = amazonCloudFormation.updateStack(updateStackRequest);
       return updateStackResult.getStackId();
     } catch (AmazonCloudFormationException e) {
-      // No changes on the stack, ignore failure
-      return amazonCloudFormation
-        .describeStacks(new DescribeStacksRequest().withStackName(description.getStackName()))
-        .getStacks()
-        .stream()
-        .findFirst()
-        .orElseThrow(() ->
-          new IllegalArgumentException("No CloudFormation Stack found with stack name " + description.getStackName()))
-        .getStackId();
+      return getStack(amazonCloudFormation).getStackId();
     }
 
   }
