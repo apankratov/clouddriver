@@ -31,9 +31,8 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
-
-import static com.amazonaws.auth.policy.actions.CloudFormationActions.DescribeStacks;
 
 @Slf4j
 public class DeployCloudFormationAtomicOperation implements AtomicOperation<Map> {
@@ -76,15 +75,17 @@ public class DeployCloudFormationAtomicOperation implements AtomicOperation<Map>
         .withValue(entry.getValue()))
       .collect(Collectors.toList());
 
-    String stackId = "";
-    StackStatus stackStatus = StackStatus.fromValue(getStack(amazonCloudFormation).getStackStatus());
-    try {
+    Optional<String> stackId = Optional.empty();
+    Optional<Stack> stack = getStack(amazonCloudFormation);
+    if (stack.isPresent()) {
+      StackStatus stackStatus = StackStatus.fromValue(stack.get().getStackStatus());
       switch (stackStatus) {
         case CREATE_FAILED:
         case ROLLBACK_COMPLETE:
           task.updateStatus(BASE_PHASE, "Stack exists, but is not updatable, deleting and re-creating.");
-          deleteStack(amazonCloudFormation);
-          stackId = createStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
+          if (deleteStack(amazonCloudFormation)) {
+            stackId = createStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
+          }
           break;
         case CREATE_COMPLETE:
         case UPDATE_ROLLBACK_COMPLETE:
@@ -98,69 +99,90 @@ public class DeployCloudFormationAtomicOperation implements AtomicOperation<Map>
           task.fail();
           break;
       }
-    } catch (IllegalArgumentException e) {
+    } else {
       stackId = createStack(amazonCloudFormation, template, parameters, tags, description.getCapabilities());
     }
-    return Collections.singletonMap("stackId", stackId);
+    if (stackId.isPresent()) {
+      return Collections.singletonMap("stackId", stackId.get());
+    } else {
+      return Collections.singletonMap("stackId", "");
+    }
   }
 
-
-  private void deleteStack(AmazonCloudFormation amazonCloudFormation) {
+  private boolean deleteStack(AmazonCloudFormation amazonCloudFormation) {
     Task task = TaskRepository.threadLocalTask.get();
-    task.updateStatus(BASE_PHASE, "Deleting CloudFormation Stack");
-    DeleteStackRequest deleteStackRequest = new DeleteStackRequest()
-      .withStackName(description.getStackName());
-    DeleteStackResult deleteStackResult = amazonCloudFormation.deleteStack(deleteStackRequest);
-    task.updateStatus(BASE_PHASE, "Stack " + description.getStackName() + " deleted.");
+    try {
+      task.updateStatus(BASE_PHASE, "Deleting CloudFormation Stack");
+      DeleteStackRequest deleteStackRequest = new DeleteStackRequest()
+        .withStackName(description.getStackName());
+      DeleteStackResult deleteStackResult = amazonCloudFormation.deleteStack(deleteStackRequest);
+      task.updateStatus(BASE_PHASE, "Stack " + description.getStackName() + " deleted.");
+      return true;
+    } catch (AmazonCloudFormationException e) {
+      task.updateStatus(BASE_PHASE, "Stack deletion failed.");
+      task.fail();
+      return false;
+    }
   }
 
-  private Stack getStack(AmazonCloudFormation amazonCloudFormation) {
+  private Optional<Stack> getStack(AmazonCloudFormation amazonCloudFormation) {
     Task task = TaskRepository.threadLocalTask.get();
-    task.updateStatus(BASE_PHASE, "Getting current CloudFormation Stack status");
     DescribeStacksRequest describeStacksRequest = new DescribeStacksRequest()
       .withStackName(description.getStackName());
-    DescribeStacksResult describeStacksResult = amazonCloudFormation.describeStacks(describeStacksRequest);
-    return describeStacksResult
-      .getStacks()
-      .stream()
-      .findFirst()
-      .orElseThrow( () ->
-        new IllegalArgumentException("No CloudFormation Stack found with stack name " + description.getStackName()));
-  }
-
-  private String createStack(AmazonCloudFormation amazonCloudFormation, String template, List<Parameter> parameters,
-                             List<Tag> tags, List<String> capabilities) {
-    Task task = TaskRepository.threadLocalTask.get();
-    task.updateStatus(BASE_PHASE, "Preparing CloudFormation Stack");
-    CreateStackRequest createStackRequest = new CreateStackRequest()
-      .withStackName(description.getStackName())
-      .withParameters(parameters)
-      .withTags(tags)
-      .withTemplateBody(template)
-      .withCapabilities(capabilities);
-    task.updateStatus(BASE_PHASE, "Uploading CloudFormation Stack");
-    CreateStackResult createStackResult = amazonCloudFormation.createStack(createStackRequest);
-    return createStackResult.getStackId();
-  }
-
-  private String updateStack(AmazonCloudFormation amazonCloudFormation, String template, List<Parameter> parameters,
-                             List<Tag> tags, List<String> capabilities) {
-    Task task = TaskRepository.threadLocalTask.get();
-    task.updateStatus(BASE_PHASE, "CloudFormation Stack exists. Updating it");
-    UpdateStackRequest updateStackRequest = new UpdateStackRequest()
-      .withStackName(description.getStackName())
-      .withParameters(parameters)
-      .withTags(tags)
-      .withTemplateBody(template)
-      .withCapabilities(capabilities);
-    task.updateStatus(BASE_PHASE, "Uploading CloudFormation Stack");
+    DescribeStacksResult describeStacksResult;
+    task.updateStatus(BASE_PHASE, "Getting current CloudFormation Stack status");
     try {
-      UpdateStackResult updateStackResult = amazonCloudFormation.updateStack(updateStackRequest);
-      return updateStackResult.getStackId();
+      describeStacksResult = amazonCloudFormation.describeStacks(describeStacksRequest);
+      return Optional.of(describeStacksResult
+        .getStacks()
+        .stream()
+        .findFirst()
+        .get());
     } catch (AmazonCloudFormationException e) {
-      return getStack(amazonCloudFormation).getStackId();
+      task.updateStatus(BASE_PHASE, "Stack doesn't exist.");
+      return Optional.empty();
     }
-
   }
 
+  private Optional<String> createStack(AmazonCloudFormation amazonCloudFormation, String template, List<Parameter> parameters,
+                             List<Tag> tags, List<String> capabilities) {
+    Task task = TaskRepository.threadLocalTask.get();
+    try {
+      task.updateStatus(BASE_PHASE, "Creating CloudFormation Stack");
+      CreateStackRequest createStackRequest = new CreateStackRequest()
+        .withStackName(description.getStackName())
+        .withParameters(parameters)
+        .withTags(tags)
+        .withTemplateBody(template)
+        .withCapabilities(capabilities);
+      CreateStackResult createStackResult = amazonCloudFormation.createStack(createStackRequest);
+      task.updateStatus(BASE_PHASE, "Stack successfully created.");
+      return Optional.of(createStackResult.getStackId());
+    } catch (AmazonCloudFormationException e) {
+      task.updateStatus(BASE_PHASE, "Stack creation failed.");
+      task.fail();
+      return Optional.empty();
+    }
+  }
+
+  private Optional<String> updateStack(AmazonCloudFormation amazonCloudFormation, String template, List<Parameter> parameters,
+                             List<Tag> tags, List<String> capabilities) {
+    Task task = TaskRepository.threadLocalTask.get();
+    try {
+      task.updateStatus(BASE_PHASE, "Updating stack.");
+      UpdateStackRequest updateStackRequest = new UpdateStackRequest()
+        .withStackName(description.getStackName())
+        .withParameters(parameters)
+        .withTags(tags)
+        .withTemplateBody(template)
+        .withCapabilities(capabilities);
+      UpdateStackResult updateStackResult = amazonCloudFormation.updateStack(updateStackRequest);
+      task.updateStatus(BASE_PHASE, "Stack successfully updated.");
+      return Optional.of(updateStackResult.getStackId());
+    } catch (AmazonCloudFormationException e) {
+      task.updateStatus(BASE_PHASE, "Stack update failed.");
+      task.fail();
+      return Optional.empty();
+    }
+  }
 }
